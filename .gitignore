@@ -1,0 +1,68 @@
+# ──────────────────────────────────────────
+#  CoLab – Root .gitignore (single source of truth)
+# ──────────────────────────────────────────
+
+# ── Python ────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+build/
+.eggs/
+
+# Virtual environments
+backend/.venv/
+backend/venv/
+backend/env/
+
+# ── Environment / Secrets ─────────────────
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+# ── Generated / large binary outputs ──────
+# Parquet datacubes (regenerated from source data)
+backend/datacubes/
+
+# Output Excel files (generated artefacts)
+backend/output_excels/
+
+# Scratch / debug outputs
+backend/test_output.json
+
+# ── Frontend (Node / Vite) ────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/*.local
+
+# npm / yarn / pnpm debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ── OS / Editor ───────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.swp
+*.swo
+
+# ── Logs ──────────────────────────────────
+*.log
+logs/
+
+# ── NOTE: backend/data/ is intentionally NOT ignored ──
+# CSV and Excel source files in backend/data/ are tracked in git.
