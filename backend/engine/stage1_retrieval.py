@@ -194,7 +194,9 @@ class EmbeddingIndex:
             self._model = SentenceTransformer(self.cfg.retrieval.embedding_model)
             return True
         except Exception as e:
-            print(f"[Retrieval] Embedding model unavailable ({type(e).__name__}). Using TF-IDF fallback.")
+            import traceback
+            print(f"[Retrieval] Embedding model unavailable ({type(e).__name__}): {e}")
+            traceback.print_exc()
             self._use_tfidf = True
             return False
 

@@ -14,8 +14,12 @@ It receives structured output from the deterministic engine and generates:
 The LLM NEVER changes rankings, scores, or allocations.
 Every decision is made upstream by the deterministic engine.
 
-Provider: OpenRouter (microsoft/mai-ds-r1:free or any configured model)
-Fallback: If LLM is unavailable, structured text summaries are returned instead.
+Fallback chain (attempted in order):
+  Stage 1: Configured model (LLM_MODEL env var / cfg.llm.model)
+  Stage 2: nvidia/nemotron-3-ultra-550b-a55b:free  (OpenRouter — skipped if no key)
+  Stage 3: nvidia/nemotron-3-super-120b-a12b:free  (OpenRouter — skipped if no key)
+  Stage 4: Local Ollama (OLLAMA_MODEL / cfg.llm.model via OLLAMA_BASE_URL)
+  Stage 5: Deterministic rule-based summary (always available)
 """
 
 from __future__ import annotations
@@ -284,84 +288,150 @@ def _build_fallback(plan: ProjectStaffingPlan) -> LLMEnrichedOutput:
 # STAGE 8 — LLM ENRICHMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
+import threading
+from collections import defaultdict
+from typing import Any, Dict
+
+# Global locks to prevent concurrent requests to the same model
+MODEL_LOCKS = defaultdict(threading.Lock)
+
+def _extract_json(raw: str) -> Dict[str, Any]:
+    """Robust helper to extract JSON content even with thinking tags or conversational text around it."""
+    # Strip thinking tags if present
+    if "<think>" in raw and "</think>" in raw:
+        parts = raw.split("</think>")
+        raw = parts[-1].strip()
+
+    # Try direct parse
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+
+    # Try finding the first '{' and last '}'
+    try:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1:
+            return json.loads(raw[start:end+1])
+    except Exception:
+        pass
+
+    raise ValueError("Response does not contain valid JSON content.")
+
+
 class LLMIntelligence:
 
     def __init__(self, cfg: EngineConfig = DEFAULT_CONFIG):
         self.cfg = cfg
-        self._client = None
 
-    def _get_client(self):
-        """Lazy-load the OpenAI-compatible client."""
-        if self._client is None:
-            try:
-                import httpx
-                from openai import OpenAI
-                api_key = os.getenv("OPENROUTER_API_KEY", "")
-                if self.cfg.llm.provider == "ollama":
-                    api_key = api_key or "ollama"
-                if not api_key:
-                    return None
-                self._client = OpenAI(
-                    base_url=self.cfg.llm.api_base,
-                    api_key=api_key,
-                    http_client=httpx.Client(),
-                )
-            except ImportError:
-                return None
-        return self._client
+    def _get_client_instance(self, api_base: str, api_key: str):
+        """Lazy-load and construct OpenAI compatible client instance."""
+        try:
+            import httpx
+            from openai import OpenAI
+            return OpenAI(
+                base_url=api_base,
+                api_key=api_key,
+                http_client=httpx.Client(),
+            )
+        except ImportError:
+            return None
 
     def enrich(self, plan: ProjectStaffingPlan) -> LLMEnrichedOutput:
         """
         Send the plan to the LLM and return enriched outputs.
-        Falls back to rule-based text if LLM is unavailable.
+
+        Attempts up to 4 model stages before falling back to rule-based output:
+          Stage 1: Configured model (LLM_MODEL / cfg.llm.model)
+          Stage 2: nvidia/nemotron-3-ultra-550b-a55b:free  (OpenRouter — skipped if no key)
+          Stage 3: nvidia/nemotron-3-super-120b-a12b:free  (OpenRouter — skipped if no key)
+          Stage 4: Local Ollama (OLLAMA_MODEL / cfg.llm.model via OLLAMA_BASE_URL)
+          Stage 5: Deterministic rule-based summary
+
+        Concurrent requests to the same model are serialised with per-model locks.
         """
         do_stage8 = os.getenv("STAGE8_LLM", "False").strip().lower() in ("true", "1", "yes")
         if not do_stage8:
             return _build_fallback(plan)
 
-        client = self._get_client()
-        if client is None:
-            return _build_fallback(plan)
+        OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+
+        openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        primary_model   = os.getenv("LLM_MODEL") or self.cfg.llm.model
+        ollama_base     = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1").strip()
+        ollama_model    = os.getenv("OLLAMA_MODEL", "").strip() or self.cfg.llm.model
+
+        # Determine Stage 1 routing: use OpenRouter if key is present or model is a free-tier one.
+        stage1_is_openrouter = bool(openrouter_key) or ":free" in primary_model
+        stage1_base = OPENROUTER_BASE if stage1_is_openrouter else self.cfg.llm.api_base
+        stage1_key  = openrouter_key if stage1_is_openrouter else (openrouter_key or "ollama")
+
+        # Build ordered list of (label, model, base_url, api_key)
+        # Stages 2 & 3 are only added when an OpenRouter key is available.
+        stages: List[tuple] = [
+            ("Stage 1", primary_model, stage1_base, stage1_key),
+        ]
+        if openrouter_key:
+            stages.append(("Stage 2", "nvidia/nemotron-3-ultra-550b-a55b:free", OPENROUTER_BASE, openrouter_key))
+            stages.append(("Stage 3", "nvidia/nemotron-3-super-120b-a12b:free", OPENROUTER_BASE, openrouter_key))
+        else:
+            print("[LLM] OPENROUTER_API_KEY not set — skipping Stage 2 and Stage 3.")
+
+        # Stage 4 — Local Ollama (no API key required)
+        stages.append(("Stage 4", ollama_model, ollama_base, "ollama"))
 
         prompt = _build_prompt(plan)
 
-        try:
-            response = client.chat.completions.create(
-                model=self.cfg.llm.model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=self.cfg.llm.max_tokens,
-                temperature=self.cfg.llm.temperature,
-                timeout=self.cfg.llm.timeout_seconds,
-                extra_headers={
-                    "HTTP-Referer": "https://colab.internal",
-                    "X-Title": "CoLab RMG Copilot",
-                },
-            )
-            raw = response.choices[0].message.content.strip()
+        for label, model, base_url, api_key in stages:
+            # Acquire lock to serialise concurrent requests to the same model
+            lock = MODEL_LOCKS[model]
+            with lock:
+                print(f"[LLM] Attempting {label} ({model}) via {base_url}...")
+                client = self._get_client_instance(base_url, api_key)
+                if not client:
+                    print(f"[LLM] {label}: client initialisation failed for {model}.")
+                    continue
 
-            # Strip markdown fences if present
-            if raw.startswith("```"):
-                raw = "\n".join(raw.split("\n")[1:])
-            if raw.endswith("```"):
-                raw = "\n".join(raw.split("\n")[:-1])
+                try:
+                    response = client.chat.completions.create(
+                        model=model,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=self.cfg.llm.max_tokens,
+                        temperature=self.cfg.llm.temperature,
+                        timeout=self.cfg.llm.timeout_seconds,
+                        extra_headers={
+                            "HTTP-Referer": "https://colab.internal",
+                            "X-Title": "CoLab RMG Copilot",
+                        },
+                    )
+                    raw = response.choices[0].message.content.strip()
 
-            data = json.loads(raw)
+                    # Strip markdown fences if present
+                    if raw.startswith("```"):
+                        raw = "\n".join(raw.split("\n")[1:])
+                    if raw.endswith("```"):
+                        raw = "\n".join(raw.split("\n")[:-1])
 
-            return LLMEnrichedOutput(
-                pipeline_id=plan.pipeline_id,
-                client=plan.client,
-                executive_summary=data.get("executive_summary", ""),
-                recommendation_rationale=data.get("recommendation_rationale", ""),
-                alternative_rejection_summary=data.get("alternative_rejection_summary", ""),
-                business_impact_narrative=data.get("business_impact_narrative", ""),
-                swap_chain_explanation=data.get("swap_chain_explanation", ""),
-                hiring_justification=data.get("hiring_justification", ""),
-                risks_and_assumptions=data.get("risks_and_assumptions", ""),
-                rm_action_notes=data.get("rm_action_notes", ""),
-                plan_comparison_table=data.get("plan_comparison_table", ""),
-                is_fallback=False,
-            )
+                    data = _extract_json(raw)
 
-        except Exception as e:
-            print(f"[LLM] Failed ({type(e).__name__}: {e}) — using fallback.")
-            return _build_fallback(plan)
+                    print(f"[LLM] {label} succeeded.")
+                    return LLMEnrichedOutput(
+                        pipeline_id=plan.pipeline_id,
+                        client=plan.client,
+                        executive_summary=data.get("executive_summary", ""),
+                        recommendation_rationale=data.get("recommendation_rationale", ""),
+                        alternative_rejection_summary=data.get("alternative_rejection_summary", ""),
+                        business_impact_narrative=data.get("business_impact_narrative", ""),
+                        swap_chain_explanation=data.get("swap_chain_explanation", ""),
+                        hiring_justification=data.get("hiring_justification", ""),
+                        risks_and_assumptions=data.get("risks_and_assumptions", ""),
+                        rm_action_notes=data.get("rm_action_notes", ""),
+                        plan_comparison_table=data.get("plan_comparison_table", ""),
+                        is_fallback=False,
+                    )
+                except Exception as e:
+                    print(f"[LLM] {label} ({model}) failed: {type(e).__name__}: {e}")
+
+        print("[LLM] All stages failed (Stage 1–4). Using Stage 5: rule-based fallback.")
+        return _build_fallback(plan)

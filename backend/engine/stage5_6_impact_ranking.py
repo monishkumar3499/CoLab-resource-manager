@@ -252,6 +252,13 @@ def _score_candidate(
     health_penalty = c.health_penalty
     swap_penalty = w.swap_complexity_penalty * plan.depth if plan.depth > 0 else 0.0
     
+    redist_penalty = 0.0
+    redist_result = getattr(c, "redistribution_result", None)
+    if redist_result and redist_result.feasible:
+        # Use default penalty or configurable weight
+        penalty_per_adj = getattr(w, "redistribution_effort_penalty", 0.04)
+        redist_penalty = redist_result.redistribution_effort * penalty_per_adj
+
     delivery_penalty = 0.0
     if plan.estimated_start_delay_days > 0:
         delay_weeks = plan.estimated_start_delay_days / 7.0
@@ -261,7 +268,7 @@ def _score_candidate(
     if not impact.acceptable:
         delivery_penalty += 0.20
 
-    total_penalties = health_penalty + swap_penalty + delivery_penalty
+    total_penalties = health_penalty + swap_penalty + delivery_penalty + redist_penalty
 
     # Final Recommendation Score
     composite = max(0.0, min(1.0, ranking_score + total_bonuses - total_penalties))

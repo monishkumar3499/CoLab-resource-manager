@@ -8,6 +8,12 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env
+load_dotenv()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # RETRIEVAL
 # ─────────────────────────────────────────────────────────────────────────────
@@ -15,8 +21,8 @@ from typing import Dict, List, Optional
 @dataclass
 class RetrievalConfig:
     top_k: int = 50                    # candidates retrieved per role slot
-    min_similarity: float = 0.20       # discard below this cosine similarity
-    embedding_model: str = "all-MiniLM-L6-v2"
+    min_similarity: float = 0.05       # discard below this cosine similarity
+    embedding_model: str = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
     chroma_persist_dir: str = "./chroma_store"
     collection_name: str = "jspark_profiles"
 
@@ -106,6 +112,15 @@ class BusinessRuleConfig:
     restricted_clients: Dict[str, List[str]] = field(default_factory=dict)
     # e.g. {"CLIENT_999": ["EMP001"]}  — EMP001 must never leave CLIENT_999
 
+    # ── Allocation Redistribution ─────────────────────────────────────────────
+    # Maximum number of existing project allocations that may be adjusted
+    # to free capacity for a new assignment (per candidate per role)
+    max_redistribution_adjustments: int = 3
+
+    # Minimum allocation % that must remain on any existing project after redistribution.
+    # Never reduce below this floor (prevents project from losing all support).
+    min_existing_project_allocation: float = 20.0
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -138,6 +153,10 @@ class RankingWeights:
     same_geo_boost:       float = 0.05
     coe_match_boost:      float = 0.05
     cluster_match_boost:  float = 0.03
+
+    # Redistribution effort penalty (applied per allocation adjustment made)
+    # Discourages unnecessary disruption when two candidates are otherwise equal
+    redistribution_effort_penalty: float = 0.04
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -192,7 +211,7 @@ URGENT_COMPOSITE_THRESHOLD: int = 34   # Gold(4)×10 + High(3) = 43 → Urgent =
 @dataclass
 class LLMConfig:
     provider: str = "ollama"
-    model: str = "deepseek-r1:8b"
+    model: str = "llama3.2:3b"
     api_base: str = "http://localhost:11434/v1"
     max_tokens: int = 2000
     temperature: float = 0.2

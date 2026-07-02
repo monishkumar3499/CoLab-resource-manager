@@ -21,6 +21,7 @@ import pandas as pd
 from .config import EngineConfig, DEFAULT_CONFIG
 from .loader import DataStore
 from .stage1_retrieval import CandidateMatch, RetrievalResult
+from .stage2_inference import CapabilityInferenceEngine, InferredCapability
 
 TODAY = pd.Timestamp(date.today())
 
@@ -46,83 +47,87 @@ class CurrentProjectContext:
 class EnrichedCandidate:
     # ── Identity ──────────────────────────────────────────────────────────────
     employee_id: str
-    job_name: str
-    role: str
-    location: str
-    geo_cluster: str
-    seniority_tier: int
-    tenure_years: float
-    department: str
+    job_name: str = ""
+    role: str = ""
+    location: str = ""
+    geo_cluster: str = ""
+    seniority_tier: int = 3
+    tenure_years: float = 0.0
+    department: str = ""
 
     # ── Retrieval signal ─────────────────────────────────────────────────────
-    semantic_score: float
-    embedding_distance: float
-    matched_skills: List[str]
-    matched_competencies: List[str]
+    semantic_score: float = 0.0
+    embedding_distance: float = 0.0
+    matched_skills: List[str] = field(default_factory=list)
+    matched_competencies: List[str] = field(default_factory=list)
 
     # ── Skill signals ────────────────────────────────────────────────────────
-    primary_coe: str
-    all_coes: List[str]
-    avg_skill_score: float
-    max_skill_score: float
-    avg_exp_years: float
-    skill_breadth: int
-    top_skills: List[Dict]          # [{Skill, SubSkill, Score, exp_years}]
-    skill_text: str
-    has_skill_data: bool
-    skill_confidence: float         # 0-1 derived from skill coverage + scores
+    primary_coe: str = ""
+    all_coes: List[str] = field(default_factory=list)
+    avg_skill_score: float = 0.0
+    max_skill_score: float = 0.0
+    avg_exp_years: float = 0.0
+    skill_breadth: int = 0
+    top_skills: List[Dict] = field(default_factory=list)          # [{Skill, SubSkill, Score, exp_years}]
+    skill_text: str = ""
+    has_skill_data: bool = False
+    skill_confidence: float = 0.0         # 0-1 derived from skill coverage + scores
 
     # ── Competency signals ───────────────────────────────────────────────────
-    avg_competency_score: float
-    competency_profile: Dict[str, int]
-    has_competency_data: bool
-    competency_confidence: float    # 0-1
+    avg_competency_score: float = 0.0
+    competency_profile: Dict[str, int] = field(default_factory=dict)
+    has_competency_data: bool = False
+    competency_confidence: float = 0.0    # 0-1
 
     # ── Availability signals ─────────────────────────────────────────────────
-    util_pct: float
-    available_capacity_pct: float
-    effective_availability: float
-    is_fully_available: bool
-    is_partially_available: bool
-    is_busy: bool
-    soon_free: bool
-    ramp_down_flag: bool
-    ramp_down_bonus: float
-    days_to_soonest_end: float
+    util_pct: float = 0.0
+    available_capacity_pct: float = 0.0
+    effective_availability: float = 0.0
+    is_fully_available: bool = False
+    is_partially_available: bool = False
+    is_busy: bool = False
+    soon_free: bool = False
+    ramp_down_flag: bool = False
+    ramp_down_bonus: float = 0.0
+    days_to_soonest_end: float = 0.0
 
     # ── Project health signals ───────────────────────────────────────────────
-    active_project_ids: List[str]
-    avg_project_health: float
-    on_red_project: bool
-    on_amber_project: bool
-    health_penalty: float
-    current_project_contexts: List[CurrentProjectContext]
+    active_project_ids: List[str] = field(default_factory=list)
+    avg_project_health: float = 0.0
+    on_red_project: bool = False
+    on_amber_project: bool = False
+    health_penalty: float = 0.0
+    current_project_contexts: List[CurrentProjectContext] = field(default_factory=list)
 
     # ── Swap / mobility signals ──────────────────────────────────────────────
-    swap_eligible: bool
-    is_bau_only: bool
+    swap_eligible: bool = False
+    is_bau_only: bool = False
 
     # ── Experience / history signals ─────────────────────────────────────────
-    client_history: List[str]
-    similar_project_count: int      # count of past projects matching pipeline COE
-    domain_experience_score: float  # 0-1 derived from COE match + past projects
-    client_experience_score: float  # 0-1: has worked with this pipeline client before
+    client_history: List[str] = field(default_factory=list)
+    similar_project_count: int = 0      # count of past projects matching pipeline COE
+    domain_experience_score: float = 0.0  # 0-1 derived from COE match + past projects
+    client_experience_score: float = 0.0  # 0-1: has worked with this pipeline client before
 
     # ── Predicted availability ───────────────────────────────────────────────
-    predicted_available_date: Optional[str]  # ISO date string or None
-    predicted_available_pct: float           # capacity expected to free up
+    predicted_available_date: Optional[str] = None  # ISO date string or None
+    predicted_available_pct: float = 0.0           # capacity expected to free up
 
     # ── Business impact estimate ────────────────────────────────────────────
-    daily_rate_estimate: float       # from config tier-based rate table
-    potential_revenue_impact: float  # if not allocated: lost revenue per week
+    daily_rate_estimate: float = 0.0       # from config tier-based rate table
+    potential_revenue_impact: float = 0.0  # if not allocated: lost revenue per week
 
     # ── Role match metadata ──────────────────────────────────────────────────
-    role_name: str
-    required_role: str
-    required_tier: int
-    required_allocation_pct: float
-    tier_delta: int                  # abs(candidate_tier - required_tier)
-    capacity_gap_pct: float          # required - available (negative = surplus)
+    role_name: str = ""
+    required_role: str = ""
+    required_tier: int = 0
+    required_allocation_pct: float = 0.0
+    tier_delta: int = 0                  # abs(candidate_tier - required_tier)
+    capacity_gap_pct: float = 0.0          # required - available (negative = surplus)
+
+    # ── Capability inference metadata ────────────────────────────────────────
+    # Populated only when has_skill_data=False and inference was run
+    inference_metadata: Optional[InferredCapability] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -276,6 +281,7 @@ class CandidateIntelligenceEngine:
     def __init__(self, ds: DataStore, cfg: EngineConfig = DEFAULT_CONFIG):
         self.ds = ds
         self.cfg = cfg
+        self._inference_engine = CapabilityInferenceEngine(ds, cfg)
 
     def enrich(
         self,
@@ -342,8 +348,30 @@ class CandidateIntelligenceEngine:
                 for pid in active_proj_ids
             ]
 
-            # ── Derived signals ───────────────────────────────────────────────
-            skill_conf = _skill_confidence(person, top_skills)
+            # ── Derived signals ───────────────────────────────────────────
+            has_skill_data = float(person.get("avg_skill_score") or 0) > 0
+            skill_conf_raw = _skill_confidence(person, top_skills)
+
+            # Run capability inference when explicit skill data is missing
+            inferred_cap: Optional[InferredCapability] = None
+            if not has_skill_data:
+                from .config import standardize_role as _std
+                _role_std = _std(str(person.get("job_name") or ""))
+                _all_coes_inf = all_coes if isinstance(all_coes, list) else []
+                _active_pids = active_proj_ids if isinstance(active_proj_ids, list) else []
+                inferred_cap = self._inference_engine.infer(
+                    employee_id=eid,
+                    role_std=_role_std,
+                    primary_coe=str(person.get("primary_coe") or "Unknown"),
+                    all_coes=_all_coes_inf,
+                    active_project_ids=_active_pids,
+                    semantic_score=match.semantic_score,
+                    pipeline_solution=pipeline_coe,
+                )
+                skill_conf = inferred_cap.confidence if inferred_cap else skill_conf_raw
+            else:
+                skill_conf = skill_conf_raw
+
             comp_conf = _competency_confidence(person)
             domain_exp = _domain_experience(person, pipeline_coe)
             client_exp = _client_experience(person, pipeline_client_upper)
@@ -429,6 +457,8 @@ class CandidateIntelligenceEngine:
                 potential_revenue_impact=daily_rate * 5,  # per week
                 # Role match
                 role_name=retrieval.role_name,
+                # Inference metadata
+                inference_metadata=inferred_cap,
                 required_role=retrieval.required_role,
                 required_tier=required_tier,
                 required_allocation_pct=retrieval.allocation_pct,

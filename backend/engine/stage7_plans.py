@@ -31,6 +31,33 @@ from .config import EngineConfig, DEFAULT_CONFIG
 from .loader import DataStore
 from .stage4_swap import BackfillResult, SwapPlan
 from .stage5_6_impact_ranking import RankedCandidate, ImpactEstimate
+from .stage3_alloc_optimizer import OptimizationResult
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# RECOMMENDATION EXPLANATION
+# ────────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class RecommendationExplanation:
+    """
+    Human-readable explanation for every staffing recommendation.
+    Designed for Resource Managers who need to understand WHY a candidate was selected.
+    Every field uses plain English with specific evidence, never generic labels.
+    """
+    headline: str                        # One-line summary: who, what level, why
+    capability_summary: str              # Explicit skill data or inference evidence
+    project_experience: str             # Matching past project experience
+    client_experience: str              # Prior billing to this client
+    domain_match: str                   # COE alignment with pipeline solution
+    geo_coe_match: str                  # Geo cluster and COE routing verdict
+    capacity_status: str                # Remaining capacity vs required
+    business_rules_passed: List[str]    # Rules that this candidate satisfies
+    business_rules_flagged: List[str]   # Soft warnings (not hard failures)
+    project_impact: str                 # Source project health and client impact
+    confidence_rationale: str           # Score breakdown in plain language
+    is_inferred: bool                   # True if skill data was inferred, not explicit
+    inference_source: Optional[str]     # e.g. "project_tech_history", None if explicit
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -72,6 +99,9 @@ class StaffingOption:
     extend_start_suggested_date: Optional[str] = None   # ISO date for revised project start
     extend_start_delay_weeks: Optional[float] = None    # how many weeks to delay
     extend_start_reason: Optional[str] = None           # human-readable explanation
+    # ── Explainability ────────────────────────────────────────────────────────────
+    explanation: Optional[RecommendationExplanation] = None
+    redistribution_result: Optional[OptimizationResult] = None
 
 
 @dataclass
@@ -167,6 +197,162 @@ def _business_impact_summary(plan: SwapPlan, impact: ImpactEstimate, candidate: 
     return " ".join(parts) if parts else "No significant impact on existing projects."
 
 
+def _build_explanation(
+    rc: RankedCandidate,
+    plan,
+    impact,
+    match_level: int,
+    level_label: str,
+) -> RecommendationExplanation:
+    """
+    Build a structured human-readable explanation for a ranked candidate.
+    Draws from the candidate's enriched profile, impact estimate, and score components.
+    """
+    c = rc.validated.candidate if hasattr(rc.validated, "candidate") else None
+    inf = getattr(c, "inference_metadata", None) if c else None
+    is_inferred = bool(inf and inf.is_inferred)
+    inference_source = inf.evidence_source if inf else None
+
+    # Capability summary
+    if is_inferred and inf:
+        cap_summary = (
+            f"Inferred capability (no explicit skill data). Evidence: {inf.reason} "
+            f"Inferred skills: {', '.join(inf.inferred_skills[:5]) or 'domain-general'}. "
+            f"Confidence: {inf.confidence:.2f}."
+        )
+    elif c and c.has_skill_data:
+        cap_summary = (
+            f"Explicit skill data available. Avg skill score: {c.avg_skill_score:.1f}/5 across "
+            f"{c.skill_breadth} skill(s). Top skills: "
+            f"{', '.join(s.get('SubSkill') or s.get('Skill', '') for s in (c.top_skills or [])[:4]) or 'N/A'}."
+        )
+    else:
+        cap_summary = "Skill data not available. Role and COE compatibility used for scoring."
+
+    # Project experience
+    proj_exp = (
+        f"{c.similar_project_count} prior project(s) with matching "
+        f"'{c.primary_coe}' COE."
+        if c and c.similar_project_count > 0
+        else "No prior project experience in matching COE found in history."
+    )
+
+    # Client experience
+    if c and c.client_experience_score >= 1.0:
+        client_exp = "Has previously billed to this client — repeat engagement."
+    else:
+        client_exp = "No prior billing history with this client."
+
+    # Domain match
+    if c:
+        domain_score = c.domain_experience_score
+        if domain_score >= 0.9:
+            domain_str = f"Primary COE '{c.primary_coe}' is an exact match to pipeline solution."
+        elif domain_score >= 0.6:
+            domain_str = f"Secondary COE match — '{c.primary_coe}' is adjacent to pipeline solution."
+        else:
+            domain_str = f"No direct COE match. Domain experience score: {domain_score:.2f}."
+    else:
+        domain_str = "Domain information not available."
+
+    # Geo/COE routing
+    geo = getattr(c, "geo_cluster", "Unknown") if c else "Unknown"
+    tier = getattr(c, "seniority_tier", 3) if c else 3
+    loc_score = rc.score_components.get("location", 0.0)
+    coe_score = rc.score_components.get("coe_match", 0.0)
+    if loc_score >= 0.8:
+        geo_verdict = "optimal"
+    elif loc_score >= 0.5:
+        geo_verdict = "acceptable"
+    else:
+        geo_verdict = "suboptimal"
+    geo_str = (
+        f"{geo} engineer, Tier {tier} role. Geo routing: {geo_verdict} "
+        f"(score {loc_score:.2f}). COE routing score: {coe_score:.2f}."
+    )
+
+    # Capacity status
+    avail = getattr(c, "effective_availability", 0.0) if c else 0.0
+    req_pct = getattr(c, "required_allocation_pct", 100.0) if c else 100.0
+    if avail >= req_pct:
+        cap_str = f"Fully available: {avail:.0f}% capacity remaining. Role requires {req_pct:.0f}%."
+    else:
+        gap = req_pct - avail
+        cap_str = (
+            f"Partially available: {avail:.0f}% of {req_pct:.0f}% required. "
+            f"Gap: {gap:.0f}%. "
+            + ("Swap planned to free up remaining capacity." if plan.candidate_type == "SWAP"
+               else "Soft commit — capacity frees up soon." if plan.candidate_type == "SOFT_COMMIT"
+               else "")
+        )
+
+    # Business rules
+    rules_passed = []
+    rules_flagged = []
+    if c:
+        rules_passed.append(f"HR-4: Not BAU-only — eligible for client projects.")
+        if avail > 0:
+            rules_passed.append(f"HR-1: Allocation within 100% ceiling ({avail:.0f}% remaining).")
+        if not c.on_red_project:
+            rules_passed.append("SR-4: Not on a RED/at-risk project.")
+        else:
+            rules_flagged.append("SR-4: Employee is on a RED project — health penalty applied.")
+        if c.ramp_down_flag:
+            rules_passed.append("SR-4: Project is ramping down — safe to release, ramp-down bonus applied.")
+        if loc_score < 0.5:
+            rules_flagged.append(f"SR-1: Geo routing suboptimal ({geo} employee, Tier {tier} role).")
+
+    # Project impact
+    if impact.client_impact == "None" and impact.source_project_health_delta >= -0.05:
+        impact_str = "No significant impact on existing projects."
+    else:
+        parts_imp = []
+        if impact.source_project_health_delta < -0.01:
+            parts_imp.append(
+                f"Source project health decreases by {abs(impact.source_project_health_delta):.0%}."
+            )
+        if impact.team_loss_fraction > 0:
+            parts_imp.append(f"Source team loses {impact.team_loss_fraction:.0%} of capacity.")
+        if impact.client_impact != "None":
+            parts_imp.append(f"Client impact on source project: {impact.client_impact}.")
+        impact_str = " ".join(parts_imp) or "Minimal impact."
+
+    # Confidence rationale
+    comp = rc.composite_score
+    cap_sc = rc.score_components.get("capability_score", 0.0)
+    ops_sc = rc.score_components.get("operational_score", 0.0)
+    bonuses = rc.score_components.get("business_bonuses", 0.0)
+    penalties = rc.score_components.get("business_penalties", 0.0)
+    conf_str = (
+        f"Final score: {comp:.3f} ({rc.confidence_band}). "
+        f"Capability: {cap_sc:.3f} (80% weight) | Operational: {ops_sc:.3f} (20% weight). "
+        + (f"Bonuses: +{bonuses:.3f}. " if bonuses > 0 else "")
+        + (f"Penalties: -{penalties:.3f}. " if penalties > 0 else "")
+        + f"Match level: {level_label}."
+        + (f" Capability inferred from {inference_source}." if is_inferred else "")
+    )
+
+    return RecommendationExplanation(
+        headline=(
+            f"[{level_label}] {rc.job_name} ({rc.employee_id}) — "
+            f"{rc.geo_cluster}, Tier {rc.seniority_tier}, "
+            f"{rc.available_capacity_pct:.0f}% available. Score: {comp:.3f} ({rc.confidence_band})."
+        ),
+        capability_summary=cap_summary,
+        project_experience=proj_exp,
+        client_experience=client_exp,
+        domain_match=domain_str,
+        geo_coe_match=geo_str,
+        capacity_status=cap_str,
+        business_rules_passed=rules_passed,
+        business_rules_flagged=rules_flagged,
+        project_impact=impact_str,
+        confidence_rationale=conf_str,
+        is_inferred=is_inferred,
+        inference_source=inference_source,
+    )
+
+
 def _build_option_from_ranked(
     rc: RankedCandidate,
     pipeline_start: Optional[str],
@@ -215,6 +401,9 @@ def _build_option_from_ranked(
     else:
         start_str = pipeline_start
 
+    # Build explanation
+    explanation = _build_explanation(rc, plan, impact, level, level_label)
+
     return StaffingOption(
         plan_type=plan_type,
         plan_label=label,
@@ -237,6 +426,8 @@ def _build_option_from_ranked(
         hire_tier_needed=None,
         hire_role_needed=None,
         score_breakdown=rc.score_components,
+        explanation=explanation,
+        redistribution_result=getattr(rc.validated.candidate, "redistribution_result", None),
     )
 
 
@@ -482,7 +673,10 @@ class RecommendationPlanGenerator:
             if opt is None:
                 counts["NONE"] += 1
             else:
-                counts[opt.plan_type] = counts.get(opt.plan_type, 0) + 1
+                p_type = opt.plan_type
+                if p_type.startswith("A_"):
+                    p_type = "A_IMMEDIATE"
+                counts[p_type] = counts.get(p_type, 0) + 1
                 if opt.plan_type == "D_HIRE":
                     if opt.hire_tier_needed:
                         hire_by_tier[opt.hire_tier_needed] = hire_by_tier.get(opt.hire_tier_needed, 0) + 1
@@ -562,7 +756,7 @@ def _build_sequence(role_plans: List[RoleStaffingPlan], sow_signed: bool, client
     if not sow_signed:
         actions.append("⚠️  SOW not yet signed — confirm SOW before finalising allocations.")
 
-    immediate = [rp for rp in role_plans if rp.recommended_option and rp.recommended_option.plan_type == "A_IMMEDIATE"]
+    immediate = [rp for rp in role_plans if rp.recommended_option and (rp.recommended_option.plan_type == "A_IMMEDIATE" or rp.recommended_option.plan_type.startswith("A_"))]
     swaps = [rp for rp in role_plans if rp.recommended_option and rp.recommended_option.plan_type == "B_SWAP"]
     waits = [rp for rp in role_plans if rp.recommended_option and rp.recommended_option.plan_type == "C_WAIT"]
     hires = [rp for rp in role_plans if rp.hire_signal]

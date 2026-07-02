@@ -99,8 +99,6 @@ Rule: Do not change the decision or propose other candidates. Your output must o
                 http_client=httpx.Client(),
             )
             model = engine.cfg.llm.model
-            if "deepseek" in model and "ollama" in engine.cfg.llm.api_base:
-                model = "microsoft/phi-3-medium-128k-instruct:free"
             response = client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
@@ -362,11 +360,13 @@ def run_excel_generation(engine, client_filter=None, project_filter=None):
             skillset_match = "No"
             if has_req_skills:
                 if opt and opt.plan_type != 'D_HIRE' and opt.recommended_employee_id:
-                    sim = opt.score_breakdown.get("semantic_similarity", 0.0)
+                    sim = opt.score_breakdown.get("semantic_similarity", 0.0) if opt.score_breakdown else 0.0
                     if sim >= 0.50:
                         skillset_match = "Complete"
-                    else:
+                    elif sim > 0.0:
                         skillset_match = "Partial"
+                    else:
+                        skillset_match = "No"
             
             allocations_raw.append({
                 "pipeline_id": plan.pipeline_id,

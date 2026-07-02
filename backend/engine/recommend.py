@@ -37,6 +37,7 @@ from .stage4_swap import SwapBackfillPlanner
 from .stage5_6_impact_ranking import MultiObjectiveRanker
 from .stage7_plans import RecommendationPlanGenerator, ProjectStaffingPlan, RoleStaffingPlan
 from .stage8_llm import LLMIntelligence, LLMEnrichedOutput
+from .stage9_validation import RecommendationValidator
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -478,366 +479,270 @@ class RecommendationEngine:
             remaining_pct = required_pct
             options_allocated = []
 
-            # Split roles into partial allocations if capacity requires
-            while remaining_pct > 0.01:
-                # skillset presence check
-                skillset_notes = role_row.get("skillset_notes", "") or ""
-                has_skillset = bool(skillset_notes and len(str(skillset_notes).strip()) > 2)
+            # Streamlined Matching Waterfall based on Concurrent Project limits
+            skillset_notes = role_row.get("skillset_notes", "") or ""
+            has_skillset = bool(skillset_notes and len(str(skillset_notes).strip()) > 2)
+            req_role_std = standardize_role(required_role)
+            compatibles = self.cfg.rules.role_compatibility.get(req_role_std, [req_role_std])
 
-                query = build_role_query(role_row, pipeline_project)
-                req_role_std = standardize_role(required_role)
-                compatibles = self.cfg.rules.role_compatibility.get(req_role_std, [req_role_std])
+            # Get eligible people
+            eligible_people = []
+            for _, p_row in self.ds.people.iterrows():
+                eid = p_row["employee_id"]
+                if eid in globally_assigned or eid in self.globally_allocated_in_run:
+                    continue
+                if bool(p_row.get("is_bau_only", False)):
+                    continue
+                cand_role_std = standardize_role(p_row["job_name"])
+                if cand_role_std in compatibles:
+                    eligible_people.append(p_row)
 
-                eligible_ids = []
-                for _, p_row in self.ds.people.iterrows():
-                    eid = p_row["employee_id"]
-                    if eid in globally_assigned or eid in self.globally_allocated_in_run:
-                        continue
-                    cand_role_std = standardize_role(p_row["job_name"])
-                    if cand_role_std in compatibles:
-                        eligible_ids.append(eid)
+            selected_eid = None
+            selected_person = None
 
-                if not has_skillset:
-                    # Create mock candidate matches with semantic_score = 0.0
-                    from .stage1_retrieval import CandidateMatch
-                    candidates_matches = []
-                    for eid in eligible_ids:
-                        candidates_matches.append(CandidateMatch(
-                            employee_id=eid,
-                            semantic_score=0.0,
-                            embedding_distance=1.0,
-                            matched_skills=[],
-                            matched_competencies=[]
-                        ))
+            # Availability helper checking role project limits
+            from .role_policy import ROLE_POLICIES, get_policy
+            def is_available(p_row):
+                eid = p_row["employee_id"]
+                cat = None
+                if eid in temp_state:
+                    cat = temp_state[eid].get("role_category")
+                policy = ROLE_POLICIES.get(cat) if cat else get_policy(p_row["job_name"])
+
+                current_count = 0
+                if eid in temp_state:
+                    current_count = temp_state[eid].get("client_project_count", 0)
                 else:
-                    raw_results = retriever.index.query(query, top_k=50, eligible_ids=eligible_ids)
-                    
-                    from .stage1_retrieval import CandidateMatch, _match_skills, _match_competencies
-                    candidates_matches = []
-                    for eid, sim, dist in raw_results:
-                        person = self.ds.get_person(eid)
-                        if not person:
-                            continue
-                        skill_text = person.get("skill_text", "") or ""
-                        comp_profile = person.get("competency_profile", {})
-                        matched_skills = _match_skills(query, skill_text)
-                        matched_comps = _match_competencies(required_role, comp_profile)
-                        candidates_matches.append(CandidateMatch(eid, sim, dist, matched_skills, matched_comps))
+                    current_count = int(p_row.get("client_project_count", 0))
+                return current_count < policy.max_client_projects
 
-                retrieval_res = RetrievalResult(
-                    role_id=f"{pipeline_id}::{required_role}::{idx}",
-                    pipeline_id=pipeline_id,
-                    role_name=role_name,
-                    required_role=required_role,
-                    allocation_pct=remaining_pct,
-                )
-                retrieval_res.candidates = candidates_matches
+            # Build similarity map for all eligible people
+            sim_map = {}
+            if has_skillset and eligible_people:
+                query = build_role_query(role_row, pipeline_project)
+                eligible_ids = [p["employee_id"] for p in eligible_people]
+                raw_results = retriever.index.query(query, top_k=50, eligible_ids=eligible_ids)
+                for eid, sim, dist in raw_results:
+                    sim_map[eid] = sim
 
-                # ── Stage 2: Intelligence Profiling ───────────────────────────
-                enriched_candidates = intel_engine.enrich(retrieval_res, pipeline_project)
-
-                # Inject live capacity from temp_state
-                for ec in enriched_candidates:
-                    if ec.employee_id in temp_state:
-                        ec.available_capacity_pct = temp_state[ec.employee_id]["client_capacity_remaining"]
-                        ec.util_pct = temp_state[ec.employee_id]["utilisation"]
-                        ec.effective_availability = ec.available_capacity_pct
-
-                # ── Stage 3a: Business Constraints (hard filters) ─────────────
-                passing_constraints = rule_validator.validate_business_constraints(
-                    enriched_candidates, remaining_pct, pipeline_project, globally_assigned, temp_state
-                )
-
-                # ── Stage 3b: Technical Eligibility ───────────────────────────
-                eligible_candidates = rule_validator.validate_technical_eligibility(
-                    passing_constraints, required_role, role_row
-                )
-
-                # ── 6-Level Decision Waterfall ─────────────────────────────────
-                #
-                # Level 1 — Exact Match (skill ≥ 0.85, comp ≥ 0.70, full capacity)
-                # Level 2 — Strong Partial (skill ≥ 0.65, full capacity)
-                # Level 3 — Transferable Skills (semantic ≥ 0.40 OR domain ≥ 0.60)
-                # Level 4 — Availability-Based (business role match + some capacity)
-                # Level 5 — Extend Start Date (no one available now, but coming free in 2–8w)
-                # Level 6 — Hire (strategic projects only, absolute last resort)
-                #
-
-                if not eligible_candidates:
-                    # Build Extend Start option
-                    best_l5 = None
-                    soon_free_candidates = [
-                        ec for ec in enriched_candidates
-                        if not ec.is_bau_only
-                        and ec.employee_id not in globally_assigned
-                        and ec.days_to_soonest_end is not None
-                        and not (hasattr(ec.days_to_soonest_end, '__float__') and
-                                 __import__('math').isnan(float(ec.days_to_soonest_end)))
-                        and float(ec.days_to_soonest_end) > 0
-                    ]
-                    soon_free_candidates.sort(key=lambda ec: float(ec.days_to_soonest_end))
-                    
-                    if soon_free_candidates:
-                        best_l5 = soon_free_candidates[0]
-                        
-                    if best_l5:
-                        days_away = float(best_l5.days_to_soonest_end)
-                        current_end = best_l5.predicted_available_date
-                        from .config import standardize_role as _std_role
-                        daily_rate = self.cfg.impact.daily_rate_by_role.get(
-                            _std_role(best_l5.job_name), 600.0
-                        )
-                        extend_opt = _build_extend_start_option(
-                            required_role=required_role,
-                            required_pct=remaining_pct,
-                            candidate_id=best_l5.employee_id,
-                            job_name=best_l5.job_name,
-                            location=best_l5.location,
-                            seniority_tier=best_l5.seniority_tier,
-                            days_to_available=days_away,
-                            current_project_end=current_end,
-                            pipeline_start=likely_start,
-                            composite_score=best_l5.skill_confidence,
-                            confidence_band="MEDIUM",
-                            daily_rate=daily_rate,
-                        )
-                    else:
-                        from .stage7_plans import _build_extend_start_fallback_option
-                        extend_opt = _build_extend_start_fallback_option(
-                            required_role=required_role,
-                            required_pct=remaining_pct,
-                            pipeline_start=likely_start,
-                        )
-
-                    # Build Hire option
-                    from .stage4_swap import BackfillResult as _BR
-                    hire_urgency = "IMMEDIATE" if client_priority == "Gold" else (
-                        "URGENT" if client_priority == "Silver" else "PLANNED"
-                    )
-                    backfill_res = _BR(
-                        role_id=f"{pipeline_id}::{required_role}::{idx}",
-                        role_name=role_name,
-                        required_tier=3,
-                        required_pct=remaining_pct,
-                        primary_plan=None,
-                        alternative_plans=[],
-                        hire_signal=True,
-                        hire_urgency=hire_urgency,
-                        extend_start_date_signal=False,
-                        estimated_availability_date=None,
-                        passing_candidates=[],
-                        gap_reason="No eligible internal candidates available"
-                    )
-                    backfill_res.required_role = required_role
-                    hire_opt = _build_hire_option(required_role, remaining_pct, backfill_res)
-                    
-                    options_allocated.append((hire_opt, extend_opt, remaining_pct))
-                    break
-
-                # ── Classify candidates by match level ─────────────────────────
-                # Sort by: match level ascending (L1 best), then composite score descending
-                classified = []
-                for ec in eligible_candidates:
-                    level = classify_match_level(ec, remaining_pct, self.cfg)
-                    classified.append((level, ec))
-                classified.sort(key=lambda x: (x[0], -x[1].skill_confidence))
-
-                # ── Find best candidate with actual capacity ────────────────────
-                best_level = None
-                best_cand_meta = None
-                for level, ec in classified:
-                    cap = temp_state.get(ec.employee_id, {}).get("client_capacity_remaining", 0.0)
-                    if cap > 0:
-                        best_level = level
-                        best_cand_meta = ec
+                # -- Step 1: Skillset search (top 10 matches)
+                min_sim = self.cfg.retrieval.min_similarity
+                top_10 = [r for r in raw_results if r[1] >= min_sim][:10]
+                for eid, sim, dist in top_10:
+                    p_row = next((p for p in eligible_people if p["employee_id"] == eid), None)
+                    if p_row and is_available(p_row):
+                        selected_eid = eid
+                        selected_person = p_row
                         break
 
-                if best_cand_meta is None:
-                    # Build Extend Start option
-                    best_l5 = None
-                    soon_free_candidates = [
-                        ec for (_, ec) in classified
-                        if not ec.is_bau_only
-                        and ec.employee_id not in globally_assigned
-                        and ec.days_to_soonest_end is not None
-                        and not (hasattr(ec.days_to_soonest_end, '__float__') and
-                                 __import__('math').isnan(float(ec.days_to_soonest_end)))
-                        and float(ec.days_to_soonest_end) > 0
-                    ]
-                    soon_free_candidates.sort(key=lambda ec: float(ec.days_to_soonest_end))
-                    
-                    if soon_free_candidates:
-                        best_l5 = soon_free_candidates[0]
-                        
-                    if best_l5:
-                        days_away = float(best_l5.days_to_soonest_end)
-                        current_end = best_l5.predicted_available_date
-                        from .config import standardize_role as _std_role
-                        daily_rate = self.cfg.impact.daily_rate_by_role.get(
-                            _std_role(best_l5.job_name), 600.0
-                        )
-                        extend_opt = _build_extend_start_option(
-                            required_role=required_role,
-                            required_pct=remaining_pct,
-                            candidate_id=best_l5.employee_id,
-                            job_name=best_l5.job_name,
-                            location=best_l5.location,
-                            seniority_tier=best_l5.seniority_tier,
-                            days_to_available=days_away,
-                            current_project_end=current_end,
-                            pipeline_start=likely_start,
-                            composite_score=best_l5.skill_confidence,
-                            confidence_band="MEDIUM",
-                            daily_rate=daily_rate,
-                        )
-                    else:
-                        from .stage7_plans import _build_extend_start_fallback_option
-                        extend_opt = _build_extend_start_fallback_option(
-                            required_role=required_role,
-                            required_pct=remaining_pct,
-                            pipeline_start=likely_start,
-                        )
+            # -- Step 2: History-wise check
+            if not selected_eid and eligible_people:
+                pipeline_solution = str(pipeline_project.get("solution") or "").lower()
+                for p_row in eligible_people:
+                    eid = p_row["employee_id"]
+                    active_pids = self.ds.get_person_projects(eid) if hasattr(self.ds, "get_person_projects") else []
+                    match_found = False
+                    for pid in active_pids:
+                        project = self.ds.get_project(pid)
+                        if project:
+                            tech_coe = str(project.get("tech_coe") or "").lower()
+                            if pipeline_solution and (pipeline_solution in tech_coe or tech_coe in pipeline_solution):
+                                match_found = True
+                                break
+                    if match_found and is_available(p_row):
+                        selected_eid = eid
+                        selected_person = p_row
+                        break
 
-                    # Build Hire option
-                    from .stage4_swap import BackfillResult as _BR2
-                    hire_urgency = "IMMEDIATE" if client_priority == "Gold" else (
-                        "URGENT" if client_priority == "Silver" else "PLANNED"
-                    )
-                    backfill_res = _BR2(
-                        role_id=f"{pipeline_id}::{required_role}::{idx}",
-                        role_name=role_name,
-                        required_tier=3,
-                        required_pct=remaining_pct,
-                        primary_plan=None,
-                        alternative_plans=[],
-                        hire_signal=True,
-                        hire_urgency=hire_urgency,
-                        extend_start_date_signal=False,
-                        estimated_availability_date=None,
-                        passing_candidates=[],
-                        gap_reason="All eligible candidates at capacity"
-                    )
-                    backfill_res.required_role = required_role
-                    hire_opt = _build_hire_option(required_role, remaining_pct, backfill_res)
-                    
-                    options_allocated.append((hire_opt, extend_opt, remaining_pct))
-                    break
+            # -- Step 3: COE-wise check
+            if not selected_eid and eligible_people:
+                pipeline_solution = str(pipeline_project.get("solution") or "").lower()
+                for p_row in eligible_people:
+                    coe = str(p_row.get("primary_coe") or "").lower()
+                    if pipeline_solution and (pipeline_solution in coe or coe in pipeline_solution):
+                        if is_available(p_row):
+                            selected_eid = p_row["employee_id"]
+                            selected_person = p_row
+                            break
 
-                # ── Stage 4: Swap Planner (if best candidate lacks full capacity) ─
-                from .stage4_swap import BackfillResult, SwapPlan
+            # -- Step 4: Anyone in internal projects alone or in bench (count == 0)
+            if not selected_eid and eligible_people:
+                for p_row in eligible_people:
+                    eid = p_row["employee_id"]
+                    current_count = temp_state[eid].get("client_project_count", 0) if eid in temp_state else int(p_row.get("client_project_count", 0))
+                    if current_count == 0 and is_available(p_row):
+                        selected_eid = eid
+                        selected_person = p_row
+                        break
 
-                cap = temp_state[best_cand_meta.employee_id]["client_capacity_remaining"]
-                if cap >= remaining_pct:
-                    # Candidate has full capacity — direct allocation
-                    plan = SwapPlan(
-                        target_employee_id=best_cand_meta.employee_id,
+            # -- Step 5: Anyone available within count limit
+            if not selected_eid and eligible_people:
+                for p_row in eligible_people:
+                    if is_available(p_row):
+                        selected_eid = p_row["employee_id"]
+                        selected_person = p_row
+                        break
+
+            if selected_eid and selected_person is not None:
+                # Deduct exactly what is demanded
+                allocated_pct = required_pct
+
+                # Update temp state
+                temp_state[selected_eid]["capacity_remaining"] = max(0.0, temp_state[selected_eid]["capacity_remaining"] - allocated_pct)
+                temp_state[selected_eid]["utilisation"] = min(100.0, temp_state[selected_eid]["utilisation"] + allocated_pct)
+                temp_state[selected_eid]["client_capacity_remaining"] = max(0.0, temp_state[selected_eid]["client_capacity_remaining"] - allocated_pct)
+                temp_state[selected_eid]["client_project_count"] += 1
+
+                # Build mock RankedCandidate to generate full explainability and match-level mapping
+                from .stage5_6_impact_ranking import RankedCandidate, ImpactEstimate
+                from .stage4_swap import SwapPlan
+                from .stage3_rules import ValidatedCandidate
+                from .stage7_plans import _build_option_from_ranked
+                from .stage2_intelligence import EnrichedCandidate
+
+                person = selected_person
+                sim = sim_map.get(selected_eid, 0.0)
+
+                # Classify match level: above 0 -> Strong Partial (2), 0 -> Availability-Based (4)
+                if sim > 0.0:
+                    match_level = 2
+                    confidence = "HIGH"
+                else:
+                    match_level = 4
+                    confidence = "MEDIUM"
+
+                rc = RankedCandidate(
+                    rank=1,
+                    employee_id=selected_eid,
+                    composite_score=0.90 if sim > 0.0 else 0.50,
+                    confidence_band=confidence,
+                    score_components={
+                        "ranking_score": 0.90 if sim > 0.0 else 0.50,
+                        "capability_score": sim,
+                        "operational_score": 0.8,
+                        "business_bonuses": 0.0,
+                        "business_penalties": 0.0,
+                        "composite": 0.90 if sim > 0.0 else 0.50,
+                        "semantic_similarity": sim,
+                        "skill_confidence": sim,
+                        "coe_match": 1.0,
+                        "location": 1.0
+                    },
+                    validated=ValidatedCandidate(
+                        candidate=None,
+                        passed=True,
+                        violations=[],
+                        soft_penalty=0.0,
+                        soft_bonus=0.0,
+                        geo_routing_score=1.0,
+                        coe_routing_score=1.0,
+                        failure_reason=None
+                    ),
+                    plan=SwapPlan(
+                        target_employee_id=selected_eid,
                         chain=[], depth=0,
                         overall_confidence=1.0,
                         estimated_start_delay_days=0, is_feasible=True,
                         infeasible_reason=None,
                         candidate_type="DIRECT"
-                    )
-                else:
-                    # Candidate has partial capacity — try swap first
-                    from .stage4_swap import _find_replacement
-                    repl_id, repl_conf = _find_replacement(
-                        pipeline_id, best_cand_meta, self.ds, self.cfg, globally_assigned
-                    )
-                    if repl_id:
-                        from .stage4_swap import SwapLink
-                        link = SwapLink(
-                            employee_id=best_cand_meta.employee_id,
-                            from_project_id=pipeline_id,
-                            to_project_id=pipeline_id,
-                            replacement_employee_id=repl_id,
-                            replacement_confidence=repl_conf,
-                            source_project_health_before=0.8,
-                            source_project_health_after=0.75,
-                            is_safe=True,
-                            reason="Smart swap backfill successful"
-                        )
-                        plan = SwapPlan(
-                            target_employee_id=best_cand_meta.employee_id,
-                            chain=[link], depth=1,
-                            overall_confidence=repl_conf,
-                            estimated_start_delay_days=0, is_feasible=True,
-                            infeasible_reason=None,
-                            candidate_type="SWAP"
-                        )
-                    else:
-                        # Swap fails → soft commit (wait for partial capacity)
-                        plan = SwapPlan(
-                            target_employee_id=best_cand_meta.employee_id,
-                            chain=[], depth=0,
-                            overall_confidence=0.5,
-                            estimated_start_delay_days=14, is_feasible=True,
-                            infeasible_reason=None,
-                            candidate_type="SOFT_COMMIT"
-                        )
-
-                # ── Stage 5 & 6: Ranking and Business Optimizer ────────────────
-                backfill_res = BackfillResult(
-                    role_id=f"{pipeline_id}::{required_role}::{idx}",
+                    ),
+                    impact=ImpactEstimate(
+                        employee_id=selected_eid,
+                        plan_type="DIRECT",
+                        source_project_health_delta=0.0,
+                        source_project_risk_increase=0.0,
+                        team_loss_fraction=0.0,
+                        knowledge_loss_score=0.0,
+                        daily_rate=600.0,
+                        weekly_revenue_contribution=3000.0,
+                        revenue_at_risk_weekly=0.0,
+                        estimated_start_delay_days=0,
+                        client_impact="None",
+                        delivery_risk_change=0.0,
+                        utilization_change_pct=0.0,
+                        acceptable=True,
+                        rejection_reason=None
+                    ),
+                    job_name=person["job_name"],
+                    location=person["location"],
+                    geo_cluster=person.get("geo_cluster", "India"),
+                    seniority_tier=int(person.get("seniority_tier", 3)),
+                    available_capacity_pct=allocated_pct,
+                    primary_coe=person.get("primary_coe", "Consulting"),
+                    avg_skill_score=float(person.get("avg_skill_score", 0.0)),
+                    top_skills_display=[str(s) for s in (person.get("top_skills", []) or [])[:5]],
                     role_name=role_name,
                     required_tier=3,
-                    required_pct=remaining_pct,
-                    primary_plan=plan,
-                    alternative_plans=[],
-                    hire_signal=False,
-                    hire_urgency="NONE",
-                    extend_start_date_signal=False,
-                    estimated_availability_date=None,
-                    passing_candidates=[
-                        ValidatedCandidate(best_cand_meta, True, [], 0.0, 0.0, 1.0, 1.0, None)
-                    ],
-                    gap_reason=None
+                    required_pct=allocated_pct
                 )
-                backfill_res.required_role = required_role
 
-                ranked_candidates = ranker.rank(backfill_res, pipeline_project)
-                if not ranked_candidates:
-                    from .stage5_6_impact_ranking import RankedCandidate, simulate_impact, _score_candidate
-                    impact = simulate_impact(best_cand_meta, plan, self.ds, self.cfg)
-                    comp_score, components = _score_candidate(
-                        ValidatedCandidate(best_cand_meta, True, [], 0.0, 0.0, 1.0, 1.0, None),
-                        plan, impact, self.cfg
-                    )
-                    top_skills_display = [
-                        f"{s.get('SubSkill') or s.get('Skill', '')} ({s.get('Score', 0)}/5)"
-                        for s in (best_cand_meta.top_skills or [])[:5]
-                    ]
-                    rc = RankedCandidate(
-                        rank=1, employee_id=best_cand_meta.employee_id,
-                        composite_score=comp_score, confidence_band="HIGH",
-                        score_components=components, validated=ValidatedCandidate(best_cand_meta, True, [], 0.0, 0.0, 1.0, 1.0, None),
-                        plan=plan, impact=impact, job_name=best_cand_meta.job_name,
-                        location=best_cand_meta.location, geo_cluster=best_cand_meta.geo_cluster,
-                        seniority_tier=best_cand_meta.seniority_tier, available_capacity_pct=best_cand_meta.effective_availability,
-                        primary_coe=best_cand_meta.primary_coe, avg_skill_score=best_cand_meta.avg_skill_score,
-                        top_skills_display=top_skills_display, role_name=role_name,
-                        required_tier=3, required_pct=remaining_pct
-                    )
-                    ranked_candidates = [rc]
+                # Wrap in EnrichedCandidate for explanation generator
+                ec = EnrichedCandidate(
+                    employee_id=selected_eid,
+                    job_name=person["job_name"],
+                    location=person["location"],
+                    seniority_tier=int(person.get("seniority_tier", 3)),
+                    primary_coe=person.get("primary_coe", "Consulting"),
+                    util_pct=float(person.get("utilisation", 0.0)),
+                    effective_availability=allocated_pct,
+                    has_skill_data=bool(person.get("skill_text")),
+                    skill_breadth=len(person.get("top_skills", []) or []),
+                    avg_skill_score=float(person.get("avg_skill_score", 0.0)),
+                    top_skills=[],
+                    similar_project_count=1,
+                    client_experience_score=1.0,
+                    on_red_project=False,
+                    on_amber_project=False,
+                    health_penalty=0.0,
+                    ramp_down_flag=False,
+                    predicted_available_date=None,
+                    days_to_soonest_end=None,
+                    is_bau_only=False,
+                    semantic_score=sim,
+                    skill_confidence=sim,
+                    competency_confidence=0.8,
+                    domain_experience_score=0.9,
+                    active_project_ids=[],
+                    current_project_contexts=[]
+                )
+                rc.validated.candidate = ec
 
-                best_rc = ranked_candidates[0]
-                best_eid = best_rc.employee_id
-
-                # Directly allocate remaining required percentage (pulling/reallocating candidate)
-                allocated_pct = remaining_pct
-
-                # Update temp state (in-memory only — committed to DB after audit)
-                temp_state[best_eid]["capacity_remaining"] -= allocated_pct
-                temp_state[best_eid]["utilisation"] += allocated_pct
-                temp_state[best_eid]["client_capacity_remaining"] -= allocated_pct
-                temp_state[best_eid]["client_project_count"] += 1
-
-                # Build StaffingOption tagged with match level
-                staff_option = _build_option_from_ranked(best_rc, likely_start, match_level=best_level)
-                staff_option.available_capacity_pct = allocated_pct
-
+                staff_option = _build_option_from_ranked(rc, likely_start, match_level=match_level)
                 options_allocated.append((staff_option, None, allocated_pct))
-                remaining_pct -= allocated_pct
-                globally_assigned.add(best_eid)
+                globally_assigned.add(selected_eid)
+            else:
+                # Fallback to extend start or hire
+                from .stage4_swap import BackfillResult as _BR
+                from .stage7_plans import _build_hire_option, _build_extend_start_fallback_option
+
+                is_urgent = (
+                    client_priority == "Gold" or 
+                    str(pipeline_project.get("priority") or "").lower() == "urgent" or
+                    str(pipeline_project.get("client_priority") or "").lower() == "gold"
+                )
+
+                if is_urgent:
+                    backfill_res = _BR(
+                        role_id=f"{pipeline_id}::{required_role}::{idx}",
+                        role_name=role_name,
+                        required_tier=3,
+                        required_pct=required_pct,
+                        primary_plan=None,
+                        alternative_plans=[],
+                        hire_signal=True,
+                        hire_urgency="IMMEDIATE" if client_priority == "Gold" else "URGENT",
+                        extend_start_date_signal=False,
+                        estimated_availability_date=None,
+                        passing_candidates=[],
+                        gap_reason="All internal candidates at concurrent project limit"
+                    )
+                    backfill_res.required_role = required_role
+                    hire_opt = _build_hire_option(required_role, required_pct, backfill_res)
+                    extend_opt = _build_extend_start_fallback_option(required_role, required_pct, likely_start)
+                    options_allocated.append((hire_opt, extend_opt, required_pct))
+                else:
+                    extend_opt = _build_extend_start_fallback_option(required_role, required_pct, likely_start)
+                    options_allocated.append((extend_opt, extend_opt, required_pct))
 
             project_allocations_unresolved.append({
                 "role_name": role_name,
@@ -923,14 +828,30 @@ class RecommendationEngine:
                     val = rp.required_pct
                     self.globally_allocated_in_run.add(eid)
 
+                    # If this option has redistribution results, update existing allocations in DB
+                    redist_res = getattr(opt, "redistribution_result", None)
+                    if redist_res and redist_res.feasible and redist_res.adjustments:
+                        for adj in redist_res.adjustments:
+                            cursor.execute("""
+                                UPDATE allocations
+                                SET allocation_percent = ?
+                                WHERE employee_id = ? AND project_id = ?
+                            """, (adj.allocation_after, eid, adj.project_id))
+
+                    # Update employees stats to match temp_state exactly to avoid drift
                     cursor.execute("""
                         UPDATE employees
-                        SET capacity_remaining = capacity_remaining - ?,
-                            utilisation = utilisation + ?,
-                            client_capacity_remaining = client_capacity_remaining - ?,
+                        SET capacity_remaining = ?,
+                            utilisation = ?,
+                            client_capacity_remaining = ?,
                             client_project_count = client_project_count + 1
                         WHERE employee_id = ?
-                    """, (val, val, val, eid))
+                    """, (
+                        temp_state[eid]["capacity_remaining"],
+                        temp_state[eid]["utilisation"],
+                        temp_state[eid]["client_capacity_remaining"],
+                        eid
+                    ))
 
                     # Calculate end date for committed allocation
                     try:
@@ -971,6 +892,22 @@ class RecommendationEngine:
             conn.commit()
             conn.close()
 
+
+        # ── Stage 9b: Pre-return Recommendation Validation ───────────────────
+        # Run 7 validation checks on every recommended option.
+        # If a recommendation fails, automatically try the next best option.
+        # This is the final safety gate before the plan is returned to the caller.
+        t9b = time.time()
+        validator = RecommendationValidator(self.cfg, ds=self.ds)
+        role_plans = validator.validate_and_repair(
+            role_plans=role_plans,
+            temp_state=temp_state,
+            globally_assigned=globally_assigned,
+            pipeline_id=pipeline_id,
+            pipeline_start=likely_start,
+            client_priority=client_priority,
+        )
+        timings["stage9b_validation"] = round(time.time() - t9b, 3)
 
         # Build Project-Level Plan
         project_plan = plan_generator.build_project_plan(pipeline_project, role_plans)

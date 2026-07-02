@@ -209,56 +209,54 @@ def _rule_hr8_concurrent_client_projects(
     cfg: EngineConfig,
 ) -> RuleViolation:
     """
-    HR-8: Enforce role-based concurrent client project policy.
-    SE/SSE: max 1 client project.
-    Enabler: max 2 client projects.
-    SC/Manager: max 3 client projects.
-    TA/Principal/AP/Partner: max 5 client projects.
-    Internal projects never count toward the limit.
+    HR-8 (PRIMARY CAPACITY GATE): Enforce role-based concurrent client project policy.
+
+    This is the ONLY hard capacity constraint:
+      - If employee has reached their max concurrent client project count → FAIL_HARD
+      - If employee is within limit → PASS, regardless of current allocation %
+
+    Allocation % is optimized separately by AllocationOptimizer (Stage 3c).
+    Do NOT reject based on allocation % here.
+
+    Limits:
+      SE / SSE            → max 1 concurrent client project
+      Solutions Enabler   → max 2 concurrent client projects
+      SC / Manager        → max 3 concurrent client projects
+      TA / Principal / AP → max 5 concurrent client projects
     """
     from .role_policy import ROLE_POLICIES, get_policy
     eid = candidate.employee_id
-    
+
     if temp_state and eid in temp_state:
         cat = temp_state[eid].get("role_category")
         policy = ROLE_POLICIES.get(cat) if cat else None
         if not policy:
             policy = get_policy(candidate.job_name)
         client_project_count = temp_state[eid].get("client_project_count", 0)
-        client_capacity_remaining = temp_state[eid].get("client_capacity_remaining", 100.0)
     else:
         policy = get_policy(candidate.job_name)
         client_project_count = 0
-        client_capacity_remaining = candidate.effective_availability
 
-    # Check concurrent client project limit and capacity floor
-    is_red = bool(candidate.on_red_project)
-    is_amber = bool(candidate.on_amber_project)
-    
-    # If on RED or AMBER project, enforce strict concurrent limit and capacity floor
-    if is_red or is_amber:
-        if client_project_count >= policy.max_client_projects:
-            return RuleViolation(
-                rule_id="HR-8",
-                outcome=RuleOutcome.FAIL_HARD,
-                message=f"Concurrent client project limit reached ({client_project_count}/{policy.max_client_projects}) for category {policy.category} on RED/AMBER project."
-            )
-        min_cap = required_pct * cfg.rules.min_available_for_role
-        if client_capacity_remaining < min_cap:
-            return RuleViolation(
-                rule_id="HR-8",
-                outcome=RuleOutcome.FAIL_HARD,
-                message=f"Insufficient client capacity floor ({client_capacity_remaining:.1f}% < {min_cap:.1f}%) on RED/AMBER project."
-            )
-    else:
-        # Candidate is on a GREEN/Good client project, or is shadow/internal/bench.
-        # They are eligible for allocation/swapping.
-        pass
+    # Hard limit: concurrent project count is the ONLY hard capacity gate
+    if client_project_count >= policy.max_client_projects:
+        return RuleViolation(
+            rule_id="HR-8",
+            outcome=RuleOutcome.FAIL_HARD,
+            message=(
+                f"Concurrent client project limit reached: {client_project_count}/{policy.max_client_projects} "
+                f"for role category '{policy.category}'. "
+                f"Cannot take on another client project regardless of allocation %."
+            ),
+        )
 
+    # Within limit — pass. Allocation % gap will be handled by AllocationOptimizer.
     return RuleViolation(
         rule_id="HR-8",
         outcome=RuleOutcome.PASS,
-        message="Role allocation policy constraints passed (candidate is on a Green/Good project or shadow/internal/bench)."
+        message=(
+            f"Concurrent project limit OK: {client_project_count}/{policy.max_client_projects} "
+            f"for category '{policy.category}'. Eligible for allocation optimization."
+        ),
     )
 
 
@@ -417,39 +415,56 @@ class BusinessRuleValidator:
         temp_state: Optional[Dict[str, Dict]] = None,
     ) -> List[EnrichedCandidate]:
         """
-        Stage 2: Non-negotiable hard business rules.
-        Filters candidate pool and returns only those passing constraints.
+        Stage 3a: Non-negotiable hard business rules.
+
+        PRIMARY CAPACITY GATE: HR-8 — concurrent client project count.
+        Allocation % is NOT a hard rejection criterion here.
+        Candidates within their project count limit pass to AllocationOptimizer (Stage 3c).
+
+        Hard failures (candidate eliminated):
+          HR-7: Double allocation in same project
+          HR-4: BAU/internal-only employee
+          HR-6: Client restriction list
+          HR-8: Concurrent client project count at maximum
+          RED/AMBER safe-to-pull: employee on at-risk project with no replacement
+
+        Soft signals (candidate kept, penalised in ranking):
+          Insufficient free capacity on a GREEN project → optimizer will attempt redistribution
         """
         pipeline_client = str(pipeline_project.get("client") or "")
         passing = []
+
         for c in candidates:
-            eid = c.employee_id
-            
-            # HR-7: Double allocation
+            # HR-7: Double allocation — hard stop
             if c.employee_id in already_assigned:
                 continue
 
-            # HR-4: BAU-only employees cannot be allocated to client projects
+            # HR-4: BAU-only — hard stop
             if c.is_bau_only:
                 continue
 
-            # HR-6: Client-specific restrictions
-            restricted = self.cfg.rules.restricted_clients.get(pipeline_client, [])
-            if c.employee_id in restricted:
+            # HR-6: Client restriction — hard stop
+            if c.employee_id in self.cfg.rules.restricted_clients.get(pipeline_client, []):
                 continue
 
-            # Check if candidate is a main/key resource on any active project
-            is_main_resource = False
-            for ctx in c.current_project_contexts:
-                if not ctx.is_safe_to_pull:
-                    is_main_resource = True
-                    break
-
-            if is_main_resource:
-                # Unsafe to pull (main resource)
+            # HR-8: Concurrent client project count — PRIMARY capacity hard gate
+            hr8 = _rule_hr8_concurrent_client_projects(c, temp_state, required_pct, self.cfg)
+            if hr8.outcome == RuleOutcome.FAIL_HARD:
                 continue
+
+            # RED/AMBER safe-to-pull: still a hard stop for at-risk projects
+            # GREEN projects: NOT a hard stop — optimizer handles capacity gap
+            is_red_or_amber = c.on_red_project or c.on_amber_project
+            if is_red_or_amber:
+                is_unsafe = any(
+                    not ctx.is_safe_to_pull
+                    for ctx in c.current_project_contexts
+                )
+                if is_unsafe:
+                    continue
 
             passing.append(c)
+
         return passing
 
     def validate_technical_eligibility(
@@ -586,25 +601,30 @@ def classify_match_level(
     candidate: EnrichedCandidate,
     required_pct: float,
     cfg: EngineConfig = DEFAULT_CONFIG,
+    redistribution_result=None,  # Optional[OptimizationResult]
 ) -> int:
     """
     Classify an eligible candidate into one of four internal match levels.
 
+    Key change from original:
+      Levels 1 and 2 no longer require effective_availability >= required_pct.
+      A candidate who can reach required_pct via AllocationOptimizer redistribution
+      is eligible for L1/L2 based on pure technical capability.
+      A redistribution_effort penalty is applied in the ranking stage instead.
+
     Level 1: Exact Match:
-        skill_confidence >= exact_match_skill_threshold (0.85)
-        AND competency_confidence >= exact_match_competency_threshold (0.70)
-        AND effective_availability >= required_pct (full capacity available now)
+        skill_confidence >= 0.85 AND competency_confidence >= 0.70
+        AND (full capacity available OR redistribution_feasible)
 
     Level 2: Strong Partial Match:
-        skill_confidence >= strong_partial_skill_threshold (0.65)
-        AND effective_availability >= required_pct
+        skill_confidence >= 0.65
+        AND (full capacity available OR redistribution_feasible)
 
     Level 3: Transferable Skills:
-        semantic_score >= transferable_semantic_threshold (0.40)
-        OR domain_experience_score >= transferable_domain_threshold (0.60)
+        semantic_score >= 0.40 OR domain_experience_score >= 0.60
 
     Level 4: Availability-Based:
-        Everything else - business role match + some capacity.
+        Everything else — business role match + any capacity path.
     """
     r = cfg.rules
     avail = candidate.effective_availability
@@ -613,16 +633,23 @@ def classify_match_level(
     sem = candidate.semantic_score
     domain = candidate.domain_experience_score
 
-    # Level 1 — Exact Match
+    # Determine if capacity is satisfied — either directly or via redistribution
+    redist_feasible = (
+        redistribution_result is not None
+        and redistribution_result.feasible
+    )
+    capacity_satisfied = avail >= required_pct or redist_feasible
+
+    # Level 1 — Exact Match (capability + capacity path confirmed)
     if (
         skill >= r.exact_match_skill_threshold
         and comp >= r.exact_match_competency_threshold
-        and avail >= required_pct
+        and capacity_satisfied
     ):
         return MATCH_LEVEL_1_EXACT
 
-    # Level 2 — Strong Partial (has the skills, has the capacity)
-    if skill >= r.strong_partial_skill_threshold and avail >= required_pct:
+    # Level 2 — Strong Partial (has the skills + capacity path)
+    if skill >= r.strong_partial_skill_threshold and capacity_satisfied:
         return MATCH_LEVEL_2_STRONG
 
     # Level 3 — Transferable (semantically related or domain-adjacent)
